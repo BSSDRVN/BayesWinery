@@ -1,0 +1,615 @@
+---
+title: 'Project: 354'
+subtitle: "Meeting 3"
+author: "Adam 'One (1)' Nordquist"
+output: pdf_document
+---
+
+```{r lib, include=FALSE}
+library(mosaic)
+library(tidyverse)
+library(bayesrules)
+library(janitor) 
+library(rstan)  
+library(bayesplot) 
+library(broom.mixed) 
+library(rstanarm) 
+library(tidybayes)
+library(e1071)
+```
+
+```{r setup, include=FALSE}
+whitewine <- read.csv("winequality-white.csv", sep = ";") %>%
+  mutate(Type = "W")
+
+redwine <- read.csv("winequality-red.csv", sep = ";") %>%
+  mutate(Type = "R")
+
+wine_correct <- rbind(whitewine, redwine)
+
+glimpse(wine_correct)
+
+#From [UC Irvine](https://archive.ics.uci.edu/dataset/186/wine+quality).
+
+#write_csv(wine_correct, file = "~/MCS-354/Project/wine_correct.csv")
+
+#qcolor_rule <- scale_color_manual(values = c("Low" = "#DD1C1A", "Medium"="#1BDAAA", "High"="#086788"))
+
+```
+
+# Setup
+
+## Set arbitrary quality groups
+
+```{r make_group, warning=FALSE}
+
+wine_correct <- wine_correct %>%
+  mutate(qgroup = case_when(quality %in% c(3, 4, 5) ~ "Low",
+                           quality %in% c(6) ~ "Medium",
+                           quality %in% c(7, 8, 9) ~ "High"),
+         qgroup = factor(qgroup, levels = c("Low", "Medium", "High")))
+
+wine_correct %>%
+  ggplot(aes(x=quality, fill = qgroup))+
+  geom_bar()+
+  scale_fill_manual(values = c("Low" = "#DD1C1A", "Medium"="#1BDAAA", "High"="#086788"),
+                    labels = c("Low" = "Low (3-5)", "Medium"="Medium (6)", "High"="High (7-9)"))+
+  labs(x="Quality Score", fill="Quality Group")
+
+wine_correct %>%
+  count(qgroup)
+```
+## Establish relationship between quality and type
+
+```{r bargraph, echo=FALSE, include=FALSE}
+wine_correct %>%
+  ggplot(aes(x=quality, color = Type))+
+  geom_bar()+
+  labs(x="Quality Rating")+
+  facet_grid(. ~ Type, labeller = labeller(Type = 
+    c("R" = "Red Wines (n = 1599)",
+      "W" = "White Wines (n = 4898)")))+
+  scale_color_manual(values = c("R" = "#ad336d", "W" = "#f9c58d"),
+                     labels=c("Red", "White"))+
+  theme_bw()
+```
+
+## EDA
+
+Long story short:
+
+- Some linear relationship b/w ABV and quality
+- ABV and volatile acidity look distinguishable enough
+
+```{r eda, echo=FALSE, warning=FALSE, include=TRUE, fig.height=2}
+wine_correct %>%
+  ggplot(aes(x=quality, y=alcohol, color = Type))+
+  geom_point()+
+  scale_color_manual(values = c("R" = "#ad336d", "W" = "#f9c58d"),
+                     labels=c("Red", "White"))+
+  facet_grid(. ~ Type, labeller = labeller(Type = 
+    c("R" = "Red Wines (n = 1599)",
+      "W" = "White Wines (n = 4898)")))+
+  theme_bw()+
+  geom_smooth(method = "lm")
+
+wine_correct %>%
+  ggplot(aes(x=alcohol))+
+  geom_histogram()+
+  facet_grid(. ~ qgroup, labeller = labeller(Type = 
+    c("R" = "Red Wines (n = 1599)",
+      "W" = "White Wines (n = 4898)")))+
+  labs(x="ABV")+
+  theme_bw()
+
+wine_correct %>%
+  ggplot(aes(x=volatile.acidity))+
+  geom_histogram()+
+  facet_grid(. ~ qgroup, labeller = labeller(Type = 
+    c("R" = "Red Wines (n = 1599)",
+      "W" = "White Wines (n = 4898)")))+
+  labs(x="Volatile Acidity")+
+  theme_bw()
+```
+
+
+# Experimentation
+
+The gameplan: 
+
+- Set the seed to make sure we grab the same observation every time
+- Grab the top observation from a dataframe of 10 randomly drawn wines
+- Observe its characteristics
+- For our purposes, explain how the model works   
+
+This first part is the slower, manual version - just to prove that it works; the "quick", "automatic" model will show that this is accurate math.
+
+## Following the Book (Manual Naive Bayes Classification)
+
+```{r following_the_book_1, include=FALSE}
+set.seed(5)
+
+ten_head_df_low <- sample_n(wine_correct, 10)
+# This was primarily here for testing that it worked.
+#  filter(qgroup == "Low") %>%
+
+linevalue <- ten_head_df_low %>%
+  head(1) %>%
+  .$alcohol
+
+dioxvalue <- ten_head_df_low %>%
+  head(1) %>%
+  .$volatile.acidity
+
+qualityvalue <- ten_head_df_low %>%
+  head(1) %>%
+  .$quality
+
+qgroupvalue <- ten_head_df_low %>%
+  head(1) %>%
+  .$qgroup
+
+typevalue <- ten_head_df_low %>%
+  head(1) %>%
+  .$Type
+```
+
+### The Chosen Wine
+
+| ABV          | Volatile Acidity | Quality Score | Quality Group | Wine Type |
+|--------------|------------------|---------------|---------------|-----------|
+| `r linevalue`| `r dioxvalue`   | `r qualityvalue` | `r qgroupvalue` | `r typevalue` |
+
+
+```{r the_book_as_well, echo=FALSE}
+#Actual distributions of alcohol level grouped by quality
+ggplot(wine_correct, aes(x = alcohol, fill = qgroup)) + 
+  geom_density(alpha = 0.7)+
+  geom_vline(xintercept = linevalue, linetype = "dashed")+
+  labs(fill = "Quality Group"
+       , title = paste("Actual density of",ten_head_df_low$qgroup[1],
+                       "group, alcohol level =", linevalue),
+       x="ABV")+
+  scale_fill_manual(values = c("Low" = "#DD1C1A", "Medium"="#1BDAAA", "High"="#086788"))
+```
+
+```{r wine_stats, include=FALSE}
+# Calculate sample mean and sd for each quality group..
+wine_correct %>% 
+  group_by(qgroup) %>% 
+  summarize(mean = mean(alcohol),
+            median = median(alcohol),
+            sd = sd(alcohol))
+```
+
+The below table informs our normal, naive classification priors.
+
+| Quality Group  | Mean  | Median | Std. Dev.    |
+|---------|-------|--------|-------|
+| Low     | 9.87  | 9.60   | 0.84  |
+| Medium  | 10.59 | 10.50  | 1.13  |
+| High    | 11.43 | 11.50  | 1.22  |
+
+```{r normal-plot, echo=FALSE}
+#..then tune a normal distribution to each group to estimate their points
+ggplot(wine_correct, aes(x = alcohol, color = qgroup)) + 
+  stat_function(fun = dnorm, args = list(mean = 9.87, sd = 0.84), aes(color = "Low")) +
+  stat_function(fun = dnorm, args = list(mean = 10.6, sd = 1.13), aes(color = "Medium")) +
+  stat_function(fun = dnorm, args = list(mean = 11.4, sd = 1.22), aes(color = "High")) + 
+  geom_vline(xintercept = linevalue, linetype = "dashed")+
+  scale_color_manual(values = c("Low" = "#DD1C1A", "Medium"="#1BDAAA", "High"="#086788"))+
+  labs(color = "Quality Group", x="ABV", 
+       title=paste("Normal priors for",ten_head_df_low$qgroup[1], "group, alcohol level =", linevalue))
+
+```
+
+### Calculations
+
+```{r bayes_rule_single_1, include=FALSE}
+
+# L(y = Low | ABV = line)
+l_low <- dnorm(linevalue, mean = 9.87, sd = 0.842)
+#p of Low in total df, f(y)
+f_low <- (wine_correct %>%
+  filter(qgroup == "Low") %>%
+  nrow()) / nrow(wine_correct)
+
+# L(y = Med | ABV = line)
+l_med <- dnorm(linevalue, mean = 10.6, sd = 1.13)
+#p of Med in total df, f(y)
+f_med <- (wine_correct %>%
+  filter(qgroup == "Medium") %>%
+  nrow()) / nrow(wine_correct)
+
+# L(y = High | ABV = line)
+l_hi <- dnorm(linevalue, mean = 11.4, sd = 1.22)
+#p of Low in total df, f(y)
+f_hi <- (wine_correct %>%
+  filter(qgroup == "High") %>%
+  nrow()) / nrow(wine_correct)
+
+nc_single <- (f_low * l_low) + (f_med * l_med) + (f_hi * l_hi)
+
+###BAYES RULE###
+p_low <- (f_low * l_low)/nc_single
+p_med <- (f_med * l_med)/nc_single
+p_hi <- (f_hi * l_hi)/nc_single
+
+```
+
+The below calculations use Bayes' Rule; the probabilities, normalizing constant, and likelihoods I already calculated and were kind of cluttering up the document, so they are hidden away. Rest assured they are calculated correctly.
+
+```{r bayes_rule_single_2}
+p_low #Probability this wine is in the Low quality group
+p_med #Probability this wine is in the Medium quality group
+p_hi #Probability this wine is in the High quality group
+
+#..and do they add up to 1?
+p_low + p_med + p_hi
+
+#Yes, they do. Compare with the predictions below...
+```
+
+## Following the Book ("Automatic" Naive Bayes Classification)
+
+```{r firstmodel, echo=FALSE}
+first <- naiveBayes(qgroup ~ alcohol, data = wine_correct)
+
+first_wine = data.frame(alcohol = linevalue)
+
+predict(first, newdata = first_wine, type = "raw")
+```
+
+This quick, one-predictor model believes there is roughly a 47% chance this seeded observation is from the Medium quality group (which it is). The question, then: Is there more to this? Can we make the model better by adding in more predictors?
+
+------
+
+# Model 2: Volatile Acidity
+
+```{r vol_grph, echo=FALSE}
+#Actual distributions of sulfur dioxide level grouped by quality
+ggplot(wine_correct, aes(x = volatile.acidity, fill = qgroup)) + 
+  geom_density(alpha = 0.7)+
+  scale_fill_manual(values = c("Low" = "#DD1C1A", "Medium"="#1BDAAA", "High"="#086788"))+
+  labs(title = "Density of Volatile Acidity", x="Volatile Acidity", fill = "Quality Group")+
+  geom_vline(xintercept = dioxvalue, linetype = "dashed")
+```
+
+
+It is worth noting (and perhaps obvious) that this would be.. *difficult* to discern quality from. You can see below that this model has kind of no idea with this single predictor - in fact, it is very convinced this is a Low-quality wine based solely on the volatile acidity, which makes sense when you look at this density graph. 
+
+```{r volmodel, echo=F}
+volmodel <- naiveBayes(qgroup ~ volatile.acidity, data = wine_correct)
+
+one_wine = data.frame(volatile.acidity = dioxvalue)
+
+predict(volmodel, newdata = one_wine, type = "raw")
+```
+
+Let's improve this by using two predictors, the ones we've spoken about already (ABV and volatile acidity).
+
+# Model 3: ABV / Volatile Acidity
+
+The observation we picked from earlier is plotted below. Note that it is in the Medium group but surrounded by a sea of Low observations, mostly due to its volatile acidity content.
+
+```{r actual_picked_observation, echo=FALSE}
+
+#Actual distributions of alcohol level grouped by quality
+ggplot(wine_correct, aes(x = alcohol, y= volatile.acidity, color = qgroup)) + 
+  geom_point()+
+  geom_vline(xintercept = linevalue, linetype = "dashed")+
+  geom_hline(yintercept = dioxvalue, linetype = "dashed")+
+  scale_color_manual(values = c("Low" = "#DD1C1A", "Medium"="#1BDAAA", "High"="#086788"))+
+  labs(title = "ABV and Volatile Acidity Relationship",
+       x="ABV", y="Volatile Acidity", color="Quality Group")
+  
+```
+
+So let's predict, given there is some separation here. Is this new model ok at predicting quality based on both characteristics?
+
+```{r bayes_oclock, echo=FALSE}
+twopredmodel <- naiveBayes(qgroup ~ alcohol + volatile.acidity, data = wine_correct)
+
+one_wine = data.frame(alcohol = linevalue, volatile.acidity = dioxvalue)
+
+predict(twopredmodel, newdata = one_wine, type = "raw")
+```
+
+The answer is "for this one, it doesn't seem to be *great*." That said, our simulated Chosen Wine is kind of an outlier in regards to these two combined characteristics, so this makes some sense.
+
+While we're at it, let's figure out if we can use the wine type, as well as the ABV, to determine wine quality group.
+
+# Model 4: ABV / Type
+
+```{r abv_and_type_1, echo=FALSE, fig.height=3}
+#Actual relationship b/w alcohol and quality, colored by wine type
+#We don't really need this graph
+ggplot(wine_correct, aes(x = alcohol, y=qgroup, color=Type))+
+  geom_point()+
+  geom_jitter()+
+  geom_hline(yintercept = qualityvalue, linetype = "dashed")+
+  geom_vline(xintercept = linevalue, linetype = "dashed")+
+  scale_color_manual(values = c("R" = "#ad336d", "W" = "#f9c58d"),
+                     labels = c("R" = "Red", "W" = "White"))+
+  labs(color = "Type of Wine",
+       title = paste(ten_head_df_low$qgroup[1], "group,",
+                     ten_head_df_low$Type[1], "type wine, ABV of", linevalue),
+       x="ABV")
+
+
+```
+
+The above graph is kind of unnecessary, but it does give us an okay glimpse of what we can expect. it is largely a reversed graph of the first experiment we ran, and it gives us the same idea: as quality goes up, so does ABV. For our observation, it could be medium or low, and it's only moderately likely to be of the High group.
+
+Let's zoom in a little on the wine type.
+
+```{r abv_and_type_2, echo=FALSE}
+#Actual relationship b/w alcohol and wine type, colored by quality group
+ggplot(wine_correct, aes(x = alcohol, y=Type, color=qgroup))+
+  geom_point()+
+  geom_jitter()+
+  geom_vline(xintercept = linevalue, linetype = "dashed")+
+  scale_color_manual(values = c("Low" = "#DD1C1A", "Medium"="#1BDAAA", "High"="#086788"))+
+  labs(color = "Quality Group",
+       title = paste(ten_head_df_low$qgroup[1], "group,",
+                     ten_head_df_low$Type[1], "type wine,",
+                     ten_head_df_low$alcohol[1], "ABV"),
+       x="ABV")
+
+#Just need to filter this out.
+wine_106 <- wine_correct %>%
+  filter(alcohol == 10.6)
+
+ggplot(wine_106, aes(x = Type, fill=qgroup))+
+  geom_bar(position="fill")+
+  scale_fill_manual(values = c("Low" = "#DD1C1A", "Medium"="#1BDAAA", "High"="#086788"))+
+  labs(fill = "Quality Group",
+       title = "Proportion of all 10.6% ABV wines",
+       x="Type")+
+  
+  #This text I did have to cobble together from the internet a little bit.
+  geom_text(aes(label = scales::percent(after_stat(count) / tapply(after_stat(count),
+                                                                   after_stat(x),
+                                                                   sum)
+                                        [after_stat(x)], accuracy = 1),
+      group = qgroup),
+    stat = "count",
+    position = position_fill(vjust = 0.5),
+    color = "white",
+    size = 6
+  )
+```
+
+Our wine could be either low, medium, or high at first glance, but the quality group fill gives some clarity - it is smack in the middle of where most Medium wines are, especially as a Red wine. We will discover soon that this will end up being useful. It is also important to note that, among all wines that are 10.6% ABV, the most likely outcome by far is a medium wine, regardless of type. When it's factored in that this is a red wine, it is a neat coin toss for "medium or not".
+
+```{r abv_and_type_3, echo=FALSE}
+#Kind of halfway distribution of wine type over the three groups
+ggplot(wine_correct, aes(x = Type, fill=qgroup))+
+  geom_bar(position = "fill")+
+  scale_fill_manual(values = c("Low" = "#DD1C1A", "Medium"="#1BDAAA", "High"="#086788"))+
+  labs(fill = "Quality Group",
+       title = paste(ten_head_df_low$qgroup[1], "group,",
+                     ten_head_df_low$Type[1], "type wine"))+
+  
+  #This text I did have to cobble together from the internet a little bit.
+  geom_text(aes(label = scales::percent(after_stat(count) / tapply(after_stat(count),
+                                                                   after_stat(x),
+                                                                   sum)
+                                        [after_stat(x)], accuracy = 1), 
+#I still don't really understand what the end of that line does, but
+#if I remove it the text breaks.
+      group = qgroup),
+    stat = "count",
+    position = position_fill(vjust = 0.5),
+    color = "white",
+    size = 6
+  )
+```
+
+This set of graphs shows it is not impossible to figure out quality group based on wine type if there are other characteristics involved, such as the already observed relationship b/w ABV and quality score. Let's give the single Type predictor a shot.
+
+## Model 4.1: Single-Var Type
+
+```{r type_by_itself, echo=FALSE}
+typesinglemodel <- naiveBayes(qgroup ~ Type, data = wine_correct)
+
+one_wine = data.frame(Type = typevalue)
+
+predict(typesinglemodel, newdata = one_wine, type = "raw")
+```
+
+The single "Type" variable does pretty okay! However, it is.. basically just replicating the data, since all it knows about is what proportions of quality come with what types of wine. What about both ABV and wine type?
+
+## Model 4.2: Both ABV and Type
+
+```{r second_attempt, echo=FALSE}
+second_attempt_model <- naiveBayes(qgroup ~ alcohol + Type, data = wine_correct)
+
+one_wine = data.frame(alcohol = linevalue, Type = typevalue)
+
+predict(second_attempt_model, newdata = one_wine, type = "raw")
+```
+
+Slightly better.. what about all three? We will see in Model 5. 
+
+## Model 5 (for fun): ABV / Volatile Acidity / Type
+
+My last attempt hits quality by everything we've talked about: ABV, volatile acidity, and type.
+
+```{r bayes_three, echo=FALSE}
+ggplot(wine_correct, aes(x = alcohol, y = volatile.acidity, color = qgroup)) +
+  geom_point() +
+  facet_wrap(. ~ Type) +
+  labs(title = "ABV vs. Volatile Acidity by Quality Group and Wine Type",
+    x = "ABV (Alcohol by Volume)",
+    y = "Volatile Acidity")+
+  theme_bw()+
+  scale_color_manual(values = c("Low" = "#DD1C1A", "Medium"="#1BDAAA", "High"="#086788"))+
+  geom_vline(xintercept = linevalue, linetype = "dashed")+
+  geom_hline(yintercept = dioxvalue, linetype = "dashed")
+
+#---------
+threepredmodel <- naiveBayes(qgroup ~ alcohol + volatile.acidity + Type, data = wine_correct)
+
+one_wine = data.frame(alcohol = linevalue, volatile.acidity = dioxvalue, Type = typevalue)
+
+predict(threepredmodel, newdata = one_wine, type = "raw")
+```
+
+
+# Model Deviations: Predicting wine type
+
+For this, I briefly deviated and found that, for this specific observation, there is a really good model to predict **wine type** once you throw in the volatile acidity - most likely due to the fact that **volatile acidity is typically high in Reds** and a wine with a volatile acidity this high would not possibly be a white wine. This knowledge came to me far too late in the final project process to change anything, so I'm not. However, I think if I were to do this again, I'd maybe try predicting wine type.
+
+```{r diox_grph, echo=FALSE}
+ggplot(wine_correct, aes(x = volatile.acidity, fill = Type)) + 
+  geom_density(alpha = 0.7)+
+  scale_fill_manual(values = c("R" = "#ad336d", "W" = "#f9c58d"),
+                     labels = c("R" = "Red", "W" = "White"))+
+  labs(title = paste(ten_head_df_low$Type[1], "wine type,",
+                     ten_head_df_low$volatile.acidity[1], "volatile acidity"),
+       x="Volatile Acidity", fill = "Wine Type")+
+  geom_vline(xintercept = dioxvalue, linetype = "dashed")
+```
+This first attempt at prediction adds ABV, quality group, and volatile acidity as predictors.
+
+```{r reverse_many_model, echo=FALSE}
+reverse_many_model <- naiveBayes(Type ~ alcohol + qgroup + volatile.acidity, data = wine_correct)
+
+one_wine = data.frame(alcohol = linevalue, qgroup = qgroupvalue, volatile.acidity = dioxvalue)
+
+predict(reverse_many_model, newdata = one_wine, type = "raw")
+```
+
+```{r reverse_actual_picked_observation}
+ggplot(wine_correct, aes(x = alcohol, y= volatile.acidity, color = Type)) + 
+  geom_point()+
+  geom_vline(xintercept = linevalue, linetype = "dashed")+
+  geom_hline(yintercept = dioxvalue, linetype = "dashed")+
+  scale_color_manual(values = c("R" = "#ad336d", "W" = "#f9c58d"),
+                     labels = c("R" = "Red", "W" = "White"))+
+  labs(title = "ABV and Volatile Acidity Relationship",
+       x="ABV", y="Volatile Acidity", color="Wine Type")
+```
+
+
+The second goes to ABV and VA, and the third does alcohol and quality group. 
+
+```{r reverse_model, echo=FALSE}
+reverse_model_1 <- naiveBayes(Type ~ alcohol + volatile.acidity, data = wine_correct)
+
+one_wine = data.frame(alcohol = linevalue, volatile.acidity = dioxvalue)
+
+predict(reverse_model_1, newdata = one_wine, type = "raw")
+
+
+## Just for fun.
+reverse_model_2 <- naiveBayes(Type ~ alcohol + qgroup, data = wine_correct)
+
+one_wine = data.frame(alcohol = linevalue, qgroup = qgroupvalue)
+
+predict(reverse_model_2, newdata = one_wine, type = "raw")
+```
+
+
+
+
+# How Good Are the Models?
+
+To recap, we have:
+
+- first, which is qgroup ~ alcohol,
+- volmodel, qgroup ~ volatile.acidity,
+- twopredmodel, qgroup ~ alcohol + volatile.acidity,
+- typesinglemodel, qgroup ~ Type,
+- second_attempt_model, qgroup ~ alcohol + Type,
+- threepredmodel, qgroup ~ alcohol + volatile.acidity + Type,
+
+- reverse_many_model, Type ~ alcohol + qgroup + volatile.acidity,
+- reverse_model, Type ~ alcohol + volatile.acidity, and
+- reverse_model_2, Type ~ alcohol + qgroup.
+
+## Cross-Validation
+
+```{r crossvalidation, include=FALSE}
+firstcv <- naive_classification_summary_cv(model = first,
+                                             data = wine_correct, y = "qgroup", k = 10)
+
+volcv <- naive_classification_summary_cv(model = volmodel,
+                                             data = wine_correct, y = "qgroup", k = 10)
+
+twocv <- naive_classification_summary_cv(model = twopredmodel,
+                                             data = wine_correct, y = "qgroup", k = 10)
+
+typecv_1 <- naive_classification_summary_cv(model = typesinglemodel,
+                                             data = wine_correct, y = "qgroup", k = 10)
+
+secondcv <- naive_classification_summary_cv(model = second_attempt_model,
+                                             data = wine_correct, y = "qgroup", k = 10)
+
+threecv <- naive_classification_summary_cv(model = threepredmodel,
+                                             data = wine_correct, y = "qgroup", k = 10)
+
+bigrev_cv <- naive_classification_summary_cv(model = reverse_many_model,
+                                             data = wine_correct, y = "Type", k = 10)
+
+rev_cv <- naive_classification_summary_cv(model = reverse_model_1,
+                                             data = wine_correct, y = "Type", k = 10)
+
+rev_c2v <- naive_classification_summary_cv(model = reverse_model_2,
+                                             data = wine_correct, y = "Type", k = 10)
+```
+
+| Model                           | Max Accuracy                          | Average Accuracy                      |
+|---------------------------------|---------------------------------------|---------------------------------------|
+| ABV                             | `r max(firstcv$folds$overall_accuracy)` | `r mean(firstcv$folds$overall_accuracy)` |
+| Volatile Acidity                | `r max(volcv$folds$overall_accuracy)`   | `r mean(volcv$folds$overall_accuracy)`   |
+| ABV + Volatile Acidity          | `r max(twocv$folds$overall_accuracy)`  | `r mean(twocv$folds$overall_accuracy)`  |
+| Wine Type                       | `r max(typecv_1$folds$overall_accuracy)` | `r mean(typecv_1$folds$overall_accuracy)` |
+| ABV + Wine Type                 | `r max(secondcv$folds$overall_accuracy)` | `r mean(secondcv$folds$overall_accuracy)` |
+| ABV + Volatile Acidity + Wine Type | `r max(threecv$folds$overall_accuracy)` | `r mean(threecv$folds$overall_accuracy)` |
+|---------------------------------|---------------------------------------|---------------------------------------|
+| Type ~ ABV + Quality Group + Volatile Acidity | `r max(bigrev_cv$folds$overall_accuracy)` | `r mean(bigrev_cv$folds$overall_accuracy)` |
+| Type ~ ABV + Volatile Acidity   | `r max(rev_cv$folds$overall_accuracy)`  | `r mean(rev_cv$folds$overall_accuracy)`  |
+| Type ~ ABV + Quality Group*     | `r max(rev_c2v$folds$overall_accuracy)` | `r mean(rev_c2v$folds$overall_accuracy)`  |
+
+
+*What I can discern from this is that the CV isn't training well enough on simply ABV and qgroup, and there's probably something skewing the training data to say "Just predict a white wine, you'll be right 75.3% (pct of whites in the total) of the time".
+
+# Conclusion
+
+## Confusion Matrices for Models 3 and 5
+
+### Model 3 (two-predictor model, ABV + Volatile Acidity)
+
+```{r confmat_2var, echo=FALSE}
+twocv$cv
+```
+
+### Model 5 (three-predictor model, ABV + Volatile Acidity + Wine Type)
+
+```{r confmat_3var, echo=FALSE}
+threecv$cv
+```
+
+These two models are largely identical in accuracy, so I'm noting both their confusion matrices. What's interesting is that what makes them similar - yet different - is that the two-predictor model is relatively good at predicting Low quality wines as Low (66.57% accuracy), while the three-predictor model isn't (53.61%); similarly, the three-predictor model is relatively good at predicting Medium-quality wines as Medium (64.03%) while the two-predictor model is not (54.41%). Both models are kind of equally garbage at predicting High-quality wines, which is (likely) mostly due to two things:
+
+- There are not many High wines (n=1277)
+- Because of that, the characteristics are less separated than they are at the L and M levels
+
+## Pt 2
+
+In general, I've found that the quality group is not very easy to predict well. The highest accuracy score of any model we tested was the three-predictor model (ABV + Volatile Acidity + Wine Type), with an accuracy score of .583, which is okay for our purposes, but wouldn't be great if this were something that had any worldly dependencies. The three-predictor model had the highest single accuracy score, but the highest average accuracy goes to the two-predictor model (ABV + Volatile Acidity) by $\approx$ .002, or 0.2\%. Both can effectively share the title, as it's so close some seed changes might swap that order.
+
+The type of wine is a little easier to process, it seems, as all the models (except for the q-group model) had higher average accuracy scores than any of the quality group prediction models. The ABV is not as great at discerning type, but volatile acidity is.
+
+```{r abv_grph, echo=FALSE}
+ggplot(wine_correct, aes(x = alcohol, fill = Type)) + 
+  geom_density(alpha = 0.7)+
+  scale_fill_manual(values = c("R" = "#ad336d", "W" = "#f9c58d"),
+                     labels = c("R" = "Red", "W" = "White"))+
+  labs(title = paste(ten_head_df_low$Type[1], "wine type,",
+                     ten_head_df_low$alcohol[1], "ABV"),
+       x="ABV", fill = "Wine Type")+
+  geom_vline(xintercept = linevalue, linetype = "dashed")
+```
